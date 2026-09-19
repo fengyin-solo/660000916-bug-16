@@ -84,6 +84,8 @@ export interface TrackSegment {
   endTime: string;
 }
 
+export type TrackLoadState = 'idle' | 'loading' | 'success' | 'empty' | 'error';
+
 export interface TrackData {
   deviceId: string;
   deviceName: string;

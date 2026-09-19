@@ -31,7 +31,8 @@ const trackPointMarker = ref<any>(null);
 const stayPointMarkers = ref<any[]>([]);
 const breachEventMarkers = ref<any[]>([]);
 const playbackMarker = ref<any>(null);
-const playbackTrailLayers = ref<any[]>([]);
+const playbackPulseCircle = ref<any>(null);
+const playbackTrail = ref<any>(null);
 
 const drawingTempCircle = ref<any>(null);
 const drawingTempPolygon = ref<any>(null);
@@ -627,8 +628,14 @@ function clearPlaybackMarker() {
     map.value!.removeLayer(playbackMarker.value);
     playbackMarker.value = null;
   }
-  playbackTrailLayers.value.forEach(layer => map.value!.removeLayer(layer));
-  playbackTrailLayers.value = [];
+  if (playbackPulseCircle.value) {
+    map.value!.removeLayer(playbackPulseCircle.value);
+    playbackPulseCircle.value = null;
+  }
+  if (playbackTrail.value) {
+    map.value!.removeLayer(playbackTrail.value);
+    playbackTrail.value = null;
+  }
 }
 
 function formatTrackTime(isoString: string): string {
@@ -757,55 +764,78 @@ function renderBreachEvents() {
   });
 }
 
-function renderPlaybackMarker() {
-  clearPlaybackMarker();
+function updatePlaybackMarker() {
+  const point = store.trackPlaybackEnabled ? store.playbackCurrentPoint : null;
 
-  if (!store.trackPlaybackEnabled || !store.playbackCurrentPoint) return;
+  // 无有效位置时只移除一次，避免标记间歇消失后残留
+  if (!point || !map.value) {
+    clearPlaybackMarker();
+    return;
+  }
 
-  const point = store.playbackCurrentPoint;
+  const latlng: [number, number] = [point.lat, point.lng];
+  const popupHtml = `
+    <b>📍 当前位置</b><br>
+    时间: ${formatTrackTime(point.timestamp)}<br>
+    速度: ${point.speed?.toFixed(1) || '0'} km/h<br>
+    电量: ${point.battery ?? '--'}%<br>
+    温度: ${point.temperature?.toFixed(1) || '--'}°C<br>
+    状态: ${point.isAbnormal ? '<span style="color:#e53935">异常</span>' : '<span style="color:#4caf50">正常</span>'}
+  `;
 
-  const pulseCircle = L.circle([point.lat, point.lng], {
-    radius: 40,
-    color: '#1976d2',
-    fillColor: '#1976d2',
-    fillOpacity: 0.15,
-    weight: 2,
-    dashArray: '5,5'
-  }).addTo(map.value!);
-  playbackTrailLayers.value.push(pulseCircle);
+  // 标记原地更新，不再每帧销毁重建，弹窗也不反复 open，避免闪烁/残影
+  if (!playbackMarker.value) {
+    playbackMarker.value = L.marker(latlng, { icon: playbackIcon })
+      .bindPopup(popupHtml)
+      .addTo(map.value);
+  } else {
+    playbackMarker.value.setLatLng(latlng);
+    playbackMarker.value.setPopupContent(popupHtml);
+  }
 
-  const marker = L.marker([point.lat, point.lng], { icon: playbackIcon })
-    .bindPopup(`
-      <b>📍 当前位置</b><br>
-      时间: ${formatTrackTime(point.timestamp)}<br>
-      速度: ${point.speed?.toFixed(1) || '0'} km/h<br>
-      电量: ${point.battery ?? '--'}%<br>
-      温度: ${point.temperature?.toFixed(1) || '--'}°C<br>
-      状态: ${point.isAbnormal ? '<span style="color:#e53935">异常</span>' : '<span style="color:#4caf50">正常</span>'}
-    `)
-    .addTo(map.value!);
+  if (!playbackPulseCircle.value) {
+    playbackPulseCircle.value = L.circle(latlng, {
+      radius: 40,
+      color: '#1976d2',
+      fillColor: '#1976d2',
+      fillOpacity: 0.15,
+      weight: 2,
+      dashArray: '5,5',
+      interactive: false
+    }).addTo(map.value);
+  } else {
+    playbackPulseCircle.value.setLatLng(latlng);
+  }
 
-  marker.openPopup();
-  playbackMarker.value = marker;
-
-  if (store.playbackCurrentIndex > 0 && store.trackData) {
-    const trailPoints = store.trackData.points.slice(
-      Math.max(0, store.playbackCurrentIndex - 20),
-      store.playbackCurrentIndex + 1
-    );
-    if (trailPoints.length >= 2) {
-      const trailLatlngs = trailPoints.map(p => [p.lat, p.lng] as [number, number]);
-      const trail = L.polyline(trailLatlngs, {
+  // 拖尾：取到当前整数点为止的固定轨迹，再加一段到插值位置的头部，保证半速平滑
+  if (store.trackData && store.playbackCurrentIndex > 0) {
+    const anchor = store.playbackCurrentIndex;
+    const base = store.trackData.points.slice(Math.max(0, anchor - 20), anchor + 1);
+    const trailLatlngs = base.map(p => [p.lat, p.lng] as [number, number]);
+    if (anchor < store.trackData.points.length - 1) {
+      trailLatlngs.push(latlng);
+    }
+    if (!playbackTrail.value) {
+      playbackTrail.value = L.polyline(trailLatlngs, {
         color: '#1976d2',
         weight: 6,
         opacity: 0.6,
-        lineCap: 'round'
-      }).addTo(map.value!);
-      playbackTrailLayers.value.push(trail);
+        lineCap: 'round',
+        interactive: false
+      }).addTo(map.value);
+    } else {
+      playbackTrail.value.setLatLngs(trailLatlngs);
     }
+  } else if (playbackTrail.value) {
+    map.value.removeLayer(playbackTrail.value);
+    playbackTrail.value = null;
   }
 
-  map.value!.panTo([point.lat, point.lng], { animate: true, duration: 0.3 });
+  // 仅在标记移出当前视口时平移，避免播放过程中地图持续抖动
+  const bounds = map.value.getBounds().pad(-0.15);
+  if (!bounds.contains(latlng)) {
+    map.value.panTo(latlng, { animate: true, duration: 0.3 });
+  }
 }
 
 function fitTrackBounds() {
@@ -857,11 +887,15 @@ watch(() => store.registrationLocation, (loc) => {
 });
 
 watch(() => store.trackData, (newTrackData) => {
+  clearPlaybackMarker();
   if (newTrackData) {
     renderTrack();
     renderStayPoints();
     renderBreachEvents();
-    fitTrackBounds();
+    if (store.trackPlaybackEnabled) {
+      fitTrackBounds();
+      updatePlaybackMarker();
+    }
   } else {
     clearAllTrackLayers();
   }
@@ -880,11 +914,17 @@ watch(() => store.showBreachEvents, () => {
 });
 
 watch(() => store.playbackCurrentPoint, () => {
-  renderPlaybackMarker();
+  updatePlaybackMarker();
 });
 
 watch(() => store.trackPlaybackEnabled, (enabled) => {
-  if (!enabled) {
+  if (enabled) {
+    renderTrack();
+    renderStayPoints();
+    renderBreachEvents();
+    fitTrackBounds();
+    updatePlaybackMarker();
+  } else {
     clearAllTrackLayers();
   }
 });
@@ -911,6 +951,15 @@ onMounted(() => {
 
   renderAllFences();
   renderAllDevices();
+
+  // 刷新恢复后回放面板可能先于/后于地图挂载，统一在此补渲染一次轨迹图层
+  if (store.trackPlaybackEnabled && store.trackData) {
+    renderTrack();
+    renderStayPoints();
+    renderBreachEvents();
+    fitTrackBounds();
+    updatePlaybackMarker();
+  }
 });
 
 onUnmounted(() => {

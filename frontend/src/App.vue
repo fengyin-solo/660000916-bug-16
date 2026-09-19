@@ -83,7 +83,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, watch, onMounted } from 'vue';
 import MapView from './components/MapView.vue';
 import DevicePanel from './components/DevicePanel.vue';
 import FenceEditor from './components/FenceEditor.vue';
@@ -94,11 +94,15 @@ import MonitorDashboard from './components/MonitorDashboard.vue';
 import DeviceHealthDiagnosis from './components/DeviceHealthDiagnosis.vue';
 import { useIotStore } from './stores/iot';
 
+type Panel = 'devices' | 'fences' | 'alarms' | 'track' | 'health';
+const PANEL_KEY = 'iot-active-panel';
+
 const store = useIotStore();
-const activePanel = ref<'devices' | 'fences' | 'alarms' | 'track' | 'health'>('alarms');
+const activePanel = ref<Panel>('alarms');
 const isDashboardMode = ref(false);
 
-function handlePanelClick(panel: 'devices' | 'fences' | 'alarms' | 'track' | 'health') {
+function handlePanelClick(panel: Panel) {
+  // 切到别的面板只暂停并保留回放数据，返回轨迹面板时状态连续
   if (activePanel.value === 'track' && panel !== 'track') {
     store.disableTrackPlayback();
   }
@@ -135,4 +139,27 @@ function enterDashboard() {
 function exitDashboard() {
   isDashboardMode.value = false;
 }
+
+watch(activePanel, (panel) => {
+  try {
+    localStorage.setItem(PANEL_KEY, panel);
+  } catch {
+    // ignore
+  }
+});
+
+onMounted(() => {
+  try {
+    const saved = localStorage.getItem(PANEL_KEY) as Panel | null;
+    if (saved === 'track' || saved === 'fences' || saved === 'devices'
+      || saved === 'alarms' || saved === 'health') {
+      activePanel.value = saved;
+      if (saved === 'track') {
+        store.enableTrackPlayback();
+      }
+    }
+  } catch {
+    // ignore
+  }
+});
 </script>
