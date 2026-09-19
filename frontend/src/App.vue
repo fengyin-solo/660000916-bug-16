@@ -100,6 +100,7 @@ const isDashboardMode = ref(false);
 
 function handlePanelClick(panel: 'devices' | 'fences' | 'alarms' | 'track' | 'health') {
   if (activePanel.value === 'track' && panel !== 'track') {
+    // 离开回放面板：暂停播放但保留数据与进度，再次进入仍一致
     store.disableTrackPlayback();
   }
   if (panel === 'track') {
@@ -107,7 +108,6 @@ function handlePanelClick(panel: 'devices' | 'fences' | 'alarms' | 'track' | 'he
   }
   activePanel.value = panel;
 }
-
 function handleAddDevice() {
   store.startDeviceRegistration();
   activePanel.value = 'devices';

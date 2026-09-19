@@ -31,7 +31,9 @@ const trackPointMarker = ref<any>(null);
 const stayPointMarkers = ref<any[]>([]);
 const breachEventMarkers = ref<any[]>([]);
 const playbackMarker = ref<any>(null);
-const playbackTrailLayers = ref<any[]>([]);
+const playbackPulseCircle = ref<any>(null);
+const playbackTrailLayer = ref<any>(null);
+const lastRenderedPointIndex = ref(-1);
 
 const drawingTempCircle = ref<any>(null);
 const drawingTempPolygon = ref<any>(null);
@@ -624,11 +626,90 @@ function clearAllTrackLayers() {
 
 function clearPlaybackMarker() {
   if (playbackMarker.value) {
+    playbackMarker.value.closePopup();
     map.value!.removeLayer(playbackMarker.value);
     playbackMarker.value = null;
   }
-  playbackTrailLayers.value.forEach(layer => map.value!.removeLayer(layer));
-  playbackTrailLayers.value = [];
+  if (playbackPulseCircle.value) {
+    map.value!.removeLayer(playbackPulseCircle.value);
+    playbackPulseCircle.value = null;
+  }
+  if (playbackTrailLayer.value) {
+    map.value!.removeLayer(playbackTrailLayer.value);
+    playbackTrailLayer.value = null;
+  }
+  lastRenderedPointIndex.value = -1;
+}
+
+function buildPlaybackPopupContent(point: any): string {
+  return `
+    <b>📍 当前位置</b><br>
+    时间: ${formatTrackTime(point.timestamp)}<br>
+    速度: ${point.speed?.toFixed(1) || '0'} km/h<br>
+    电量: ${point.battery ?? '--'}%<br>
+    温度: ${point.temperature?.toFixed(1) || '--'}°C<br>
+    状态: ${point.isAbnormal ? '<span style="color:#e53935">异常</span>' : '<span style="color:#4caf50">正常</span>'}
+  `;
+}
+
+// 平滑更新回放标记：位置跟随插值坐标，采样点变化时才刷新 popup/轨迹尾迹，
+// 不再每次 tick 销毁重建图层，避免 0.5x 时标记闪烁、popup 残留。
+function renderPlaybackMarker() {
+  if (!store.trackPlaybackEnabled || !store.trackData ||
+      !store.playbackLocation || !store.playbackCurrentPoint) {
+    clearPlaybackMarker();
+    return;
+  }
+
+  const loc = store.playbackLocation;
+  const point = store.playbackCurrentPoint;
+  const pointIndex = store.playbackCurrentIndex;
+
+  if (!playbackMarker.value) {
+    playbackPulseCircle.value = L.circle([loc.lat, loc.lng], {
+      radius: 40,
+      color: '#1976d2',
+      fillColor: '#1976d2',
+      fillOpacity: 0.15,
+      weight: 2,
+      dashArray: '5,5'
+    }).addTo(map.value!);
+
+    playbackMarker.value = L.marker([loc.lat, loc.lng], { icon: playbackIcon })
+      .bindPopup(buildPlaybackPopupContent(point))
+      .addTo(map.value!);
+
+    lastRenderedPointIndex.value = pointIndex;
+  } else {
+    playbackMarker.value.setLatLng([loc.lat, loc.lng]);
+    playbackPulseCircle.value?.setLatLng([loc.lat, loc.lng]);
+  }
+
+  // 采样点切换时刷新弹窗内容与已走轨迹
+  if (pointIndex !== lastRenderedPointIndex.value) {
+    lastRenderedPointIndex.value = pointIndex;
+    playbackMarker.value.setPopupContent(buildPlaybackPopupContent(point));
+
+    if (playbackTrailLayer.value) {
+      map.value!.removeLayer(playbackTrailLayer.value);
+      playbackTrailLayer.value = null;
+    }
+    const points = store.trackData.points;
+    if (pointIndex > 0 && points.length > 1) {
+      const trailPoints = points.slice(Math.max(0, pointIndex - 20), pointIndex + 1);
+      if (trailPoints.length >= 2) {
+        playbackTrailLayer.value = L.polyline(
+          trailPoints.map(p => [p.lat, p.lng] as [number, number]),
+          { color: '#1976d2', weight: 6, opacity: 0.6, lineCap: 'round' }
+        ).addTo(map.value!);
+      }
+    }
+  }
+
+  // 仅在标记移出当前视野时平移，播放过程中不抢占用户的地图操作
+  if (!map.value!.getBounds().contains([loc.lat, loc.lng])) {
+    map.value!.panTo([loc.lat, loc.lng], { animate: true, duration: 0.3 });
+  }
 }
 
 function formatTrackTime(isoString: string): string {
@@ -757,57 +838,6 @@ function renderBreachEvents() {
   });
 }
 
-function renderPlaybackMarker() {
-  clearPlaybackMarker();
-
-  if (!store.trackPlaybackEnabled || !store.playbackCurrentPoint) return;
-
-  const point = store.playbackCurrentPoint;
-
-  const pulseCircle = L.circle([point.lat, point.lng], {
-    radius: 40,
-    color: '#1976d2',
-    fillColor: '#1976d2',
-    fillOpacity: 0.15,
-    weight: 2,
-    dashArray: '5,5'
-  }).addTo(map.value!);
-  playbackTrailLayers.value.push(pulseCircle);
-
-  const marker = L.marker([point.lat, point.lng], { icon: playbackIcon })
-    .bindPopup(`
-      <b>📍 当前位置</b><br>
-      时间: ${formatTrackTime(point.timestamp)}<br>
-      速度: ${point.speed?.toFixed(1) || '0'} km/h<br>
-      电量: ${point.battery ?? '--'}%<br>
-      温度: ${point.temperature?.toFixed(1) || '--'}°C<br>
-      状态: ${point.isAbnormal ? '<span style="color:#e53935">异常</span>' : '<span style="color:#4caf50">正常</span>'}
-    `)
-    .addTo(map.value!);
-
-  marker.openPopup();
-  playbackMarker.value = marker;
-
-  if (store.playbackCurrentIndex > 0 && store.trackData) {
-    const trailPoints = store.trackData.points.slice(
-      Math.max(0, store.playbackCurrentIndex - 20),
-      store.playbackCurrentIndex + 1
-    );
-    if (trailPoints.length >= 2) {
-      const trailLatlngs = trailPoints.map(p => [p.lat, p.lng] as [number, number]);
-      const trail = L.polyline(trailLatlngs, {
-        color: '#1976d2',
-        weight: 6,
-        opacity: 0.6,
-        lineCap: 'round'
-      }).addTo(map.value!);
-      playbackTrailLayers.value.push(trail);
-    }
-  }
-
-  map.value!.panTo([point.lat, point.lng], { animate: true, duration: 0.3 });
-}
-
 function fitTrackBounds() {
   if (!store.trackData || store.trackData.points.length === 0) return;
 
@@ -862,10 +892,11 @@ watch(() => store.trackData, (newTrackData) => {
     renderStayPoints();
     renderBreachEvents();
     fitTrackBounds();
+    renderPlaybackMarker();
   } else {
     clearAllTrackLayers();
   }
-}, { deep: true });
+});
 
 watch(() => store.showTrack, () => {
   renderTrack();
@@ -879,12 +910,17 @@ watch(() => store.showBreachEvents, () => {
   renderBreachEvents();
 });
 
-watch(() => store.playbackCurrentPoint, () => {
+watch(() => store.playbackLocation, () => {
   renderPlaybackMarker();
 });
 
 watch(() => store.trackPlaybackEnabled, (enabled) => {
-  if (!enabled) {
+  if (enabled) {
+    renderTrack();
+    renderStayPoints();
+    renderBreachEvents();
+    renderPlaybackMarker();
+  } else {
     clearAllTrackLayers();
   }
 });
@@ -911,6 +947,15 @@ onMounted(() => {
 
   renderAllFences();
   renderAllDevices();
+
+  // 刷新恢复或面板重新挂载后，若已有回放会话则恢复图层与标记
+  if (store.trackPlaybackEnabled && store.trackData) {
+    renderTrack();
+    renderStayPoints();
+    renderBreachEvents();
+    fitTrackBounds();
+    renderPlaybackMarker();
+  }
 });
 
 onUnmounted(() => {

@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { ref, computed } from 'vue';
+import { ref, computed, watch } from 'vue';
 import type { Device, Geofence, Alert, AlertType, AlertSeverity, DeviceGroup, DeviceThresholds, TrackData, TrackPoint, StayPoint, TrackSegment, HealthDataPoint, DeviceHealth, HealthSummary } from '../types';
 
 function generateId(prefix: string) {
@@ -61,18 +61,30 @@ export const useIotStore = defineStore('iot', () => {
   const isRegisteringDevice = ref(false);
   const registrationLocation = ref<{ lat: number; lng: number } | null>(null);
 
+  // 'idle' 未查询 | 'loading' 加载中 | 'ready' 有数据 | 'empty' 暂无数据 | 'error' 加载失败
+  const trackStatus = ref<'idle' | 'loading' | 'ready' | 'empty' | 'error'>('idle');
+  const trackError = ref<string>('');
   const trackPlaybackEnabled = ref(false);
   const trackData = ref<TrackData | null>(null);
-  const playbackDeviceId = ref<string | null>(null);
+  const playbackDeviceId = ref<string>('');
   const playbackStartTime = ref<string>('');
   const playbackEndTime = ref<string>('');
-  const playbackCurrentIndex = ref(0);
+  // 小数播放位置：允许倍速为小数（如 0.5），采样点通过 floor 取用，
+  // 标记位置/时间在相邻采样点之间做线性插值，保证半速平滑推进。
+  const playbackPosition = ref(0);
   const isPlaying = ref(false);
   const playbackSpeed = ref(1);
   const showTrack = ref(true);
   const showStayPoints = ref(true);
   const showBreachEvents = ref(true);
-  const playbackInterval = ref<number | null>(null);
+
+  const TICK_INTERVAL_MS = 100;
+  // 1x 速度下每真实秒推进 5 个采样点（即 200ms 一个点，与既有节奏一致）；
+  // 0.5x 时 400ms 一个点，标记/时间在点间插值平滑移动。
+  const BASE_POINTS_PER_SECOND = 5;
+  let playbackTimer: number | null = null;
+  let loadRequestToken = 0;
+  let lastQuery: { deviceId: string; startTime: string; endTime: string } | null = null;
 
   const groups = ref<DeviceGroup[]>([
     { id: 'g1', name: '生产车间', color: '#1976d2', description: '生产线设备' },
@@ -128,21 +140,61 @@ export const useIotStore = defineStore('iot', () => {
   const warningCount = computed(() => warningAlerts.value.length);
   const infoCount = computed(() => infoAlerts.value.length);
 
+  const playbackPointCount = computed(() => trackData.value?.points.length ?? 0);
+
+  // 当前展示的采样点下标（整数），始终落在有效范围内
+  const playbackCurrentIndex = computed(() => {
+    const count = playbackPointCount.value;
+    if (count === 0) return 0;
+    return Math.min(Math.floor(playbackPosition.value + 1e-9), count - 1);
+  });
+
   const playbackCurrentPoint = computed(() => {
-    if (!trackData.value || playbackCurrentIndex.value < 0 || playbackCurrentIndex.value >= trackData.value.points.length) {
-      return null;
-    }
-    return trackData.value.points[playbackCurrentIndex.value];
+    if (!trackData.value || playbackPointCount.value === 0) return null;
+    return trackData.value.points[playbackCurrentIndex.value] ?? null;
   });
 
   const playbackProgress = computed(() => {
-    if (!trackData.value || trackData.value.points.length === 0) return 0;
-    return (playbackCurrentIndex.value / (trackData.value.points.length - 1)) * 100;
+    const count = playbackPointCount.value;
+    if (count <= 1) return 0;
+    return (playbackPosition.value / (count - 1)) * 100;
   });
 
-  const playbackCurrentTime = computed(() => {
-    return playbackCurrentPoint.value?.timestamp || '';
+  // 在相邻采样点之间线性插值得到的地图坐标，0.5x 时标记平滑移动而非逐点跳动
+  const playbackLocation = computed<{ lat: number; lng: number } | null>(() => {
+    if (!trackData.value || playbackPointCount.value === 0) return null;
+    const points = trackData.value.points;
+    const pos = Math.max(0, Math.min(playbackPosition.value, points.length - 1));
+    const i0 = Math.floor(pos + 1e-9);
+    if (i0 >= points.length - 1) {
+      return { lat: points[points.length - 1].lat, lng: points[points.length - 1].lng };
+    }
+    const frac = pos - i0;
+    const p0 = points[i0];
+    const p1 = points[i0 + 1];
+    return {
+      lat: p0.lat + (p1.lat - p0.lat) * frac,
+      lng: p0.lng + (p1.lng - p0.lng) * frac
+    };
   });
+
+  // 时间轴时间同样按插值时间推进，半速下连续不跳变
+  const playbackCurrentTime = computed(() => {
+    if (!trackData.value || playbackPointCount.value === 0) return '';
+    const points = trackData.value.points;
+    const pos = Math.max(0, Math.min(playbackPosition.value, points.length - 1));
+    const i0 = Math.floor(pos + 1e-9);
+    const t0 = new Date(points[i0].timestamp).getTime();
+    if (i0 >= points.length - 1 || Number.isNaN(t0)) return points[i0].timestamp;
+    const t1 = new Date(points[i0 + 1].timestamp).getTime();
+    if (Number.isNaN(t1)) return points[i0].timestamp;
+    return new Date(t0 + (t1 - t0) * (pos - i0)).toISOString();
+  });
+
+  const isPlaybackEnded = computed(() =>
+    playbackPointCount.value > 1 &&
+    playbackPosition.value >= playbackPointCount.value - 1 - 1e-9
+  );
 
   function getDeviceById(id: string) {
     return devices.value.find(d => d.id === id);
@@ -501,103 +553,281 @@ export const useIotStore = defineStore('iot', () => {
     };
   }
 
-  function loadTrackData(deviceId: string, startTime: string, endTime: string) {
+  function stopPlaybackTimer() {
+    if (playbackTimer !== null) {
+      window.clearInterval(playbackTimer);
+      playbackTimer = null;
+    }
+  }
+
+  // 单一 ticker：播放期间固定节奏运行，倍速变化即时生效，无需重启定时器，
+  // 避免播放中切换倍速造成的跳动与错位。
+  function ensurePlaybackTimer() {
+    if (playbackTimer !== null) return;
+    playbackTimer = window.setInterval(() => {
+      if (!isPlaying.value || !trackData.value) return;
+      const count = trackData.value.points.length;
+      if (count <= 1) {
+        isPlaying.value = false;
+        return;
+      }
+      const advance = playbackSpeed.value * BASE_POINTS_PER_SECOND * (TICK_INTERVAL_MS / 1000);
+      const next = playbackPosition.value + advance;
+      if (next >= count - 1 - 1e-9) {
+        playbackPosition.value = count - 1;
+        isPlaying.value = false;
+        savePlaybackState();
+      } else {
+        playbackPosition.value = next;
+      }
+    }, TICK_INTERVAL_MS);
+  }
+
+  // 模拟异步请求；保留随机轨迹生成，但加一层网络/服务异常处理
+  function fetchTrackData(deviceId: string, startTime: string, endTime: string): Promise<TrackData> {
+    return new Promise((resolve, reject) => {
+      window.setTimeout(() => {
+        try {
+          const data = generateMockTrackData(deviceId, startTime, endTime);
+          resolve(data);
+        } catch (err) {
+          reject(err instanceof Error ? err : new Error('轨迹数据生成失败'));
+        }
+      }, 300);
+    });
+  }
+
+  async function loadTrackData(deviceId: string, startTime: string, endTime: string) {
+    const startMs = new Date(startTime).getTime();
+    const endMs = new Date(endTime).getTime();
+
+    if (!deviceId) {
+      trackStatus.value = 'error';
+      trackError.value = '请先选择设备';
+      return;
+    }
+    if (!startTime || !endTime || Number.isNaN(startMs) || Number.isNaN(endMs)) {
+      trackStatus.value = 'error';
+      trackError.value = '请选择有效的开始与结束时间';
+      return;
+    }
+    if (startMs >= endMs) {
+      trackStatus.value = 'error';
+      trackError.value = '开始时间需早于结束时间';
+      return;
+    }
+
+    // 使上一次未完成的请求失效：快速重新查询/中断时不被旧响应覆盖
+    const token = ++loadRequestToken;
+    lastQuery = { deviceId, startTime, endTime };
     playbackDeviceId.value = deviceId;
     playbackStartTime.value = startTime;
     playbackEndTime.value = endTime;
-    trackData.value = generateMockTrackData(deviceId, startTime, endTime);
-    playbackCurrentIndex.value = 0;
-    stopPlayback();
+    pausePlayback();
+    trackData.value = null;
+    trackError.value = '';
+    trackStatus.value = 'loading';
+    saveTrackSession();
+
+    try {
+      const data = await fetchTrackData(deviceId, startTime, endTime);
+      if (token !== loadRequestToken) return; // 已被新查询或关闭中断
+      trackData.value = data;
+      playbackPosition.value = 0;
+      trackStatus.value = data.points.length > 0 ? 'ready' : 'empty';
+      saveTrackSession();
+      savePlaybackState();
+    } catch (err) {
+      if (token !== loadRequestToken) return;
+      trackStatus.value = 'error';
+      trackError.value = err instanceof Error ? err.message : '轨迹数据加载失败';
+      trackData.value = null;
+    }
+  }
+
+  async function retryLoadTrack() {
+    if (lastQuery) {
+      await loadTrackData(lastQuery.deviceId, lastQuery.startTime, lastQuery.endTime);
+    }
   }
 
   function startPlayback() {
-    if (!trackData.value || trackData.value.points.length === 0) return;
+    if (!trackData.value || playbackPointCount.value === 0) return;
+    if (playbackPointCount.value === 1) return; // 单点轨迹无可播放内容
 
-    if (playbackCurrentIndex.value >= trackData.value.points.length - 1) {
-      playbackCurrentIndex.value = 0;
+    // 播放结束后再次播放：从头重新开始
+    if (playbackPosition.value >= playbackPointCount.value - 1 - 1e-9) {
+      playbackPosition.value = 0;
     }
-
     isPlaying.value = true;
-    const baseInterval = 200;
-
-    if (playbackInterval.value) {
-      clearInterval(playbackInterval.value);
-    }
-
-    playbackInterval.value = window.setInterval(() => {
-      if (playbackCurrentIndex.value < trackData.value!.points.length - 1) {
-        playbackCurrentIndex.value += playbackSpeed.value;
-        if (playbackCurrentIndex.value >= trackData.value!.points.length - 1) {
-          playbackCurrentIndex.value = trackData.value!.points.length - 1;
-          stopPlayback();
-        }
-      } else {
-        stopPlayback();
-      }
-    }, baseInterval);
+    ensurePlaybackTimer();
+    savePlaybackState();
   }
 
   function pausePlayback() {
     isPlaying.value = false;
-    if (playbackInterval.value) {
-      clearInterval(playbackInterval.value);
-      playbackInterval.value = null;
-    }
+    savePlaybackState();
   }
 
   function stopPlayback() {
     isPlaying.value = false;
-    if (playbackInterval.value) {
-      clearInterval(playbackInterval.value);
-      playbackInterval.value = null;
-    }
+    playbackPosition.value = 0;
+    savePlaybackState();
+  }
+
+  function seekToPosition(position: number) {
+    if (!trackData.value || playbackPointCount.value === 0) return;
+    const max = playbackPointCount.value - 1;
+    playbackPosition.value = Math.max(0, Math.min(position, max));
+    savePlaybackState();
   }
 
   function seekToIndex(index: number) {
-    if (!trackData.value) return;
-    playbackCurrentIndex.value = Math.max(0, Math.min(index, trackData.value.points.length - 1));
+    seekToPosition(Math.round(index));
   }
 
   function seekToProgress(progress: number) {
-    if (!trackData.value || trackData.value.points.length === 0) return;
-    const index = Math.floor(progress * (trackData.value.points.length - 1) / 100);
-    seekToIndex(index);
+    if (!trackData.value || playbackPointCount.value <= 1) return;
+    const position = (Math.max(0, Math.min(progress, 100)) / 100) * (playbackPointCount.value - 1);
+    seekToPosition(position);
   }
 
+  // 倍速只改变推进速率，不触碰播放位置，播放中切换同样平滑
   function setPlaybackSpeed(speed: number) {
     playbackSpeed.value = speed;
-    if (isPlaying.value) {
-      pausePlayback();
-      startPlayback();
-    }
+    if (isPlaying.value) ensurePlaybackTimer();
+    savePlaybackState();
   }
 
   function jumpToStayPoint(stayPoint: StayPoint) {
-    if (!trackData.value) return;
+    if (!trackData.value || playbackPointCount.value === 0) return;
     const idx = trackData.value.points.findIndex(p => p.timestamp >= stayPoint.startTime);
-    if (idx !== -1) {
-      seekToIndex(idx);
-    }
+    if (idx !== -1) seekToIndex(idx);
   }
 
   function jumpToBreachEvent(breachPoint: TrackPoint) {
-    if (!trackData.value) return;
-    const idx = trackData.value.points.findIndex(p => p.timestamp === breachPoint.timestamp);
-    if (idx !== -1) {
-      seekToIndex(idx);
+    if (!trackData.value || playbackPointCount.value === 0) return;
+    const idx = trackData.value.points.findIndex(
+      p => Math.abs(new Date(p.timestamp).getTime() - new Date(breachPoint.timestamp).getTime()) < 1000
+    );
+    if (idx !== -1) seekToIndex(idx);
+  }
+
+  const SESSION_STORAGE_KEY = 'iot-track-playback-session';
+  const STATE_STORAGE_KEY = 'iot-track-playback-state';
+
+  function saveTrackSession() {
+    try {
+      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({
+        deviceId: playbackDeviceId.value,
+        startTime: playbackStartTime.value,
+        endTime: playbackEndTime.value,
+        data: trackData.value
+      }));
+    } catch {
+      // localStorage 不可用（隐私模式等）时静默降级
     }
   }
 
+  function savePlaybackState() {
+    try {
+      localStorage.setItem(STATE_STORAGE_KEY, JSON.stringify({
+        position: playbackPosition.value,
+        speed: playbackSpeed.value,
+        isPlaying: isPlaying.value,
+        showTrack: showTrack.value,
+        showStayPoints: showStayPoints.value,
+        showBreachEvents: showBreachEvents.value
+      }));
+    } catch {
+      // ignore
+    }
+  }
+
+  function restorePlaybackSession() {
+    try {
+      const sessionRaw = localStorage.getItem(SESSION_STORAGE_KEY);
+      const stateRaw = localStorage.getItem(STATE_STORAGE_KEY);
+      if (!sessionRaw) return false;
+      const session = JSON.parse(sessionRaw);
+      if (!session?.data?.points || !Array.isArray(session.data.points)) return false;
+      trackData.value = session.data as TrackData;
+      playbackDeviceId.value = session.deviceId || '';
+      playbackStartTime.value = session.startTime || '';
+      playbackEndTime.value = session.endTime || '';
+      trackStatus.value = session.data.points.length > 0 ? 'ready' : 'empty';
+
+      if (stateRaw) {
+        const state = JSON.parse(stateRaw);
+        const max = Math.max(0, session.data.points.length - 1);
+        playbackPosition.value = Math.max(0, Math.min(Number(state.position) || 0, max));
+        playbackSpeed.value = [0.5, 1, 2, 4, 8].includes(Number(state.speed)) ? Number(state.speed) : 1;
+        showTrack.value = state.showTrack !== false;
+        showStayPoints.value = state.showStayPoints !== false;
+        showBreachEvents.value = state.showBreachEvents !== false;
+        // 刷新前正在播放：恢复后继续，保证刷新后回放状态一致
+        if (state.isPlaying === true && session.data.points.length > 1 &&
+            playbackPosition.value < max - 1e-9) {
+          isPlaying.value = true;
+          ensurePlaybackTimer();
+        }
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function clearPlaybackSession() {
+    try {
+      localStorage.removeItem(SESSION_STORAGE_KEY);
+      localStorage.removeItem(STATE_STORAGE_KEY);
+    } catch {
+      // ignore
+    }
+  }
+
+  // 返回回放列表（关闭面板）：保留数据与播放进度，再次打开仍一致
   function enableTrackPlayback() {
     trackPlaybackEnabled.value = true;
+    if (trackData.value && isPlaying.value) ensurePlaybackTimer();
   }
 
   function disableTrackPlayback() {
     trackPlaybackEnabled.value = false;
-    stopPlayback();
+    pausePlayback();
+  }
+
+  // 放弃当前查询/会话（设备或时间条件变化后的显式重置）
+  function resetTrackSession() {
+    loadRequestToken++; // 中断进行中的加载
+    pausePlayback();
+    stopPlaybackTimer();
     trackData.value = null;
-    playbackDeviceId.value = null;
-    playbackCurrentIndex.value = 0;
+    playbackDeviceId.value = '';
+    playbackStartTime.value = '';
+    playbackEndTime.value = '';
+    playbackPosition.value = 0;
+    trackStatus.value = 'idle';
+    trackError.value = '';
+    lastQuery = null;
+    clearPlaybackSession();
+  }
+
+  // 刷新页面后恢复上次回放会话；状态变化时持久化
+  restorePlaybackSession();
+
+  watch([showTrack, showStayPoints, showBreachEvents, playbackSpeed], savePlaybackState);
+
+  let positionSaveTimer: number | null = null;
+  watch(playbackPosition, () => {
+    if (positionSaveTimer !== null) window.clearTimeout(positionSaveTimer);
+    positionSaveTimer = window.setTimeout(savePlaybackState, 400);
+  });
+
+  // 页面关闭前确保最新播放位置已写入
+  if (typeof window !== 'undefined') {
+    window.addEventListener('beforeunload', savePlaybackState);
   }
 
   function toggleTrackVisibility() {
@@ -613,9 +843,10 @@ export const useIotStore = defineStore('iot', () => {
   }
 
   function formatDuration(seconds: number): string {
+    if (!Number.isFinite(seconds) || seconds < 0) return '0秒';
     const hours = Math.floor(seconds / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
-    const secs = seconds % 60;
+    const secs = Math.floor(seconds % 60);
     if (hours > 0) {
       return `${hours}小时${minutes}分${secs}秒`;
     } else if (minutes > 0) {
@@ -867,7 +1098,8 @@ export const useIotStore = defineStore('iot', () => {
     trackPlaybackEnabled, trackData, playbackDeviceId,
     playbackStartTime, playbackEndTime, playbackCurrentIndex,
     isPlaying, playbackSpeed, showTrack, showStayPoints, showBreachEvents,
-    playbackCurrentPoint, playbackProgress, playbackCurrentTime,
+    trackStatus, trackError, playbackPointCount, isPlaybackEnded,
+    playbackCurrentPoint, playbackProgress, playbackLocation, playbackCurrentTime,
     deviceHealthList, priorityInspectionList, healthSummary, recentAbnormalRecords,
     getDeviceById, getFenceById, getGroupById, getDeviceHealth,
     acknowledgeAlert, batchAcknowledgeAlerts, acknowledgeAllAlerts,
@@ -875,8 +1107,8 @@ export const useIotStore = defineStore('iot', () => {
     startMockAlertStream, stopMockAlertStream,
     addFence, updateFence, deleteFence, selectFence, setEditMode,
     addDevice, startDeviceRegistration, cancelDeviceRegistration, setRegistrationLocation,
-    loadTrackData, startPlayback, pausePlayback, stopPlayback,
-    seekToIndex, seekToProgress, setPlaybackSpeed,
+    loadTrackData, retryLoadTrack, resetTrackSession, startPlayback, pausePlayback, stopPlayback,
+    seekToIndex, seekToProgress, seekToPosition, setPlaybackSpeed,
     jumpToStayPoint, jumpToBreachEvent,
     enableTrackPlayback, disableTrackPlayback,
     toggleTrackVisibility, toggleStayPointsVisibility, toggleBreachEventsVisibility,
